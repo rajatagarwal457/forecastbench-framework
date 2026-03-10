@@ -15,12 +15,15 @@ EXA_MCP_URL_WITH_ADVANCED = config.EXA_MCP_BASE + "?tools=web_search_advanced_ex
 
 
 async def _search(query: str, session: ClientSession,
-                  end_date: str | None = None) -> str:
+                  end_date: str | None = None,
+                  max_chars: int = 0) -> str:
     """Call web_search_advanced_exa with optional date cutoff."""
     args: dict = {
         "query": query,
         "numResults": 8,
     }
+    if max_chars > 0:
+        args["contextMaxCharacters"] = max_chars
     if end_date:
         args["endPublishedDate"] = end_date
 
