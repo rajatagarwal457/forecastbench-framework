@@ -1,0 +1,11 @@
+.env
+__pycache__/
+data/
+submissions/
+*.json
+*.csv
+*.log
+*.err
+*.out
+*.err
+*.out
