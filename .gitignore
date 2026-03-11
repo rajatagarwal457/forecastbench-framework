@@ -2,10 +2,8 @@
 __pycache__/
 data/
 submissions/
-*.json
+progress/
+logs/
 *.csv
-*.log
-*.err
-*.out
 *.err
 *.out

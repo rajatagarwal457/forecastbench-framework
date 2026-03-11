@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.forecastbench.org)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:arxiv.org)",
+      "Bash(cygpath:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:docs.exa.ai)",
+      "WebFetch(domain:exa.ai)",
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:mcp.exa.ai)",
+      "Bash(curl:*)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "WebFetch(domain:manifold.markets)",
+      "WebFetch(domain:api.manifold.markets)",
+      "WebFetch(domain:www.reddit.com)",
+      "WebFetch(domain:community.anthropic.com)",
+      "Bash(ls:*)",
+      "WebSearch",
+      "WebFetch(domain:docs.vllm.ai)",
+      "WebFetch(domain:deepwiki.com)",
+      "WebFetch(domain:aider.chat)",
+      "WebFetch(domain:openai.github.io)",
+      "WebFetch(domain:cookbook.openai.com)",
+      "WebFetch(domain:strandsagents.com)",
+      "WebFetch(domain:developers.openai.com)",
+      "WebFetch(domain:gist.github.com)",
+      "WebFetch(domain:mike.bailey.net.au)",
+      "WebFetch(domain:www.aurelio.ai)"
+    ]
+  }
+}

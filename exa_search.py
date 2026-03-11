@@ -2,16 +2,22 @@
 
 Uses web_search_advanced_exa for date-filtered searches (fair backtesting).
 Multiple searches per question to build richer context.
+Auto-reconnects on connection drops (long-running sessions).
 """
 
 import asyncio
+import logging
 from mcp import ClientSession, types
 from mcp.client.streamable_http import streamable_http_client
 
 import config
 
+log = logging.getLogger(__name__)
+
 # Enable the advanced search tool via URL param
 EXA_MCP_URL_WITH_ADVANCED = config.EXA_MCP_BASE + "?tools=web_search_advanced_exa"
+
+MAX_SEARCH_RETRIES = 3
 
 
 async def _search(query: str, session: ClientSession,
@@ -39,15 +45,12 @@ def _build_search_queries(question_text: str, background: str, source: str) -> l
     """Build multiple search queries for diverse context."""
     queries = []
 
-    # Query 1: the question itself
     queries.append(question_text[:400])
 
-    # Query 2: core topic as news search
     core = question_text.replace("Will ", "").replace("?", "").strip()
     if len(core) > 30:
         queries.append(f"{core[:200]} latest news")
 
-    # Query 3: source-specific for dataset questions
     if source in config.DATASET_SOURCES and background and background != "N/A":
         queries.append(f"{background[:300]} forecast outlook")
 
@@ -57,8 +60,7 @@ def _build_search_queries(question_text: str, background: str, source: str) -> l
 class ExaSearcher:
     """Manages an MCP connection to Exa with date-filtered search.
 
-    For backtests, pass date_cutoff (YYYY-MM-DD) to only get results
-    published before the forecast due date. For live runs, leave it None.
+    Auto-reconnects on connection drops. Safe for long-running sessions.
     """
 
     def __init__(self, date_cutoff: str | None = None):
@@ -67,38 +69,71 @@ class ExaSearcher:
         self._cm_session = None
         self._lock = asyncio.Lock()
         self.date_cutoff = date_cutoff
+        self._connected = False
 
-    async def connect(self):
+    def _build_url(self) -> str:
         url = EXA_MCP_URL_WITH_ADVANCED
         if config.EXA_API_KEY:
             url += f"&exaApiKey={config.EXA_API_KEY}"
+        return url
+
+    async def connect(self):
+        """Open connection and initialize session."""
+        url = self._build_url()
         self._cm_transport = streamable_http_client(url=url)
         read_stream, write_stream, _ = await self._cm_transport.__aenter__()
         self._cm_session = ClientSession(read_stream, write_stream)
         self._session = await self._cm_session.__aenter__()
         await self._session.initialize()
 
-        # Verify advanced tool is available
         tools = await self._session.list_tools()
         tool_names = [t.name for t in tools.tools]
         if "web_search_advanced_exa" not in tool_names:
             raise RuntimeError(
                 f"web_search_advanced_exa not available. Got: {tool_names}"
             )
+        self._connected = True
 
     async def close(self):
-        if self._cm_session:
-            await self._cm_session.__aexit__(None, None, None)
-        if self._cm_transport:
-            await self._cm_transport.__aexit__(None, None, None)
+        """Tear down session and connection, swallowing errors."""
+        self._connected = False
+        try:
+            if self._cm_session:
+                await self._cm_session.__aexit__(None, None, None)
+        except Exception:
+            pass
+        try:
+            if self._cm_transport:
+                await self._cm_transport.__aexit__(None, None, None)
+        except Exception:
+            pass
         self._session = None
+        self._cm_session = None
+        self._cm_transport = None
+
+    async def _reconnect(self):
+        """Close and reopen the connection."""
+        log.warning("Reconnecting to Exa MCP...")
+        await self.close()
+        await self.connect()
+        log.info("Reconnected to Exa MCP.")
 
     async def search(self, query: str) -> str:
-        """Search with date cutoff applied."""
-        if not self._session:
-            raise RuntimeError("Not connected. Call connect() first.")
+        """Search with auto-reconnect on failure."""
         async with self._lock:
-            return await _search(query, self._session, self.date_cutoff)
+            for attempt in range(1, MAX_SEARCH_RETRIES + 1):
+                try:
+                    if not self._connected or not self._session:
+                        await self._reconnect()
+                    return await _search(query, self._session, self.date_cutoff)
+                except Exception as e:
+                    log.warning(f"Search attempt {attempt}/{MAX_SEARCH_RETRIES} "
+                                f"failed: {e}")
+                    if attempt < MAX_SEARCH_RETRIES:
+                        await self._reconnect()
+                    else:
+                        log.error(f"Search failed after {MAX_SEARCH_RETRIES} attempts")
+                        raise
 
     async def search_for_question(self, question_text: str, background: str = "",
                                   source: str = "") -> str:
@@ -111,7 +146,6 @@ class ExaSearcher:
             try:
                 result = await self.search(query)
                 if result:
-                    # Basic dedup by URL
                     lines = result.split("\n")
                     filtered = []
                     for line in lines:
@@ -124,7 +158,8 @@ class ExaSearcher:
 
                     block = "\n".join(filtered)
                     all_results.append(f"--- Search {i+1}: {query[:80]} ---\n{block}")
-            except Exception:
+            except Exception as e:
+                log.warning(f"Search for question failed on query {i+1}: {e}")
                 continue
 
         return "\n\n".join(all_results)
@@ -135,21 +170,3 @@ class ExaSearcher:
 
     async def __aexit__(self, *exc):
         await self.close()
-
-
-async def test_search():
-    """Quick test with date cutoff."""
-    import sys
-    sys.stdout.reconfigure(encoding="utf-8")
-
-    # Simulate backtest: only results before 2025-12-21
-    async with ExaSearcher(date_cutoff="2025-12-21") as exa:
-        tools = await exa._session.list_tools()
-        print(f"Tools: {[t.name for t in tools.tools]}")
-        result = await exa.search("Will Tesla have more autonomous rides than Waymo?")
-        print(f"Total: {len(result):,} chars")
-        print(result[:1000])
-
-
-if __name__ == "__main__":
-    asyncio.run(test_search())
