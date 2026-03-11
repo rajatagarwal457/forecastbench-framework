@@ -122,29 +122,42 @@ class ExaSearcher:
         await self.connect()
         log.info("Fresh connection established.")
 
+    async def _do_search(self, query: str) -> str:
+        """Execute a single search. Runs inside an isolated task."""
+        if not self._connected or not self._session:
+            await self._fresh_connect()
+        return await _search(query, self._session, self.date_cutoff)
+
     async def search(self, query: str) -> str:
         """Search with auto-reconnect and rate limit backoff.
 
-        On any failure, the dead connection is abandoned (not closed)
-        and a fresh one is created. This prevents cancel scope pollution.
+        Each attempt runs in an isolated asyncio.Task so that CancelledError
+        from dead MCP cancel scopes doesn't poison our main task.
         """
         async with self._lock:
             last_error = None
             for attempt in range(MAX_SEARCH_RETRIES):
                 try:
-                    if not self._connected or not self._session:
-                        await self._fresh_connect()
-                    return await _search(query, self._session, self.date_cutoff)
+                    # Run in a separate task to isolate cancel scopes
+                    task = asyncio.create_task(self._do_search(query))
+                    return await asyncio.shield(task)
 
-                except BaseException as e:
+                except (asyncio.CancelledError, BaseException) as e:
                     last_error = e
                     self._abandon()
 
-                    # The dead MCP cancel scope marks our task as cancelled.
-                    # Uncancel it so we can actually continue (sleep, reconnect, etc).
-                    task = asyncio.current_task()
-                    if task and task.cancelling():
-                        task.uncancel()
+                    # Ensure our own task is not marked cancelled
+                    me = asyncio.current_task()
+                    while me and me.cancelling():
+                        me.uncancel()
+
+                    # Cancel the isolated task if still running
+                    if not task.done():
+                        task.cancel()
+                        try:
+                            await task
+                        except BaseException:
+                            pass
 
                     if _is_rate_limit(e):
                         wait = RATE_LIMIT_BACKOFF[min(attempt, len(RATE_LIMIT_BACKOFF) - 1)]
