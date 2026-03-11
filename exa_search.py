@@ -138,8 +138,13 @@ class ExaSearcher:
 
                 except BaseException as e:
                     last_error = e
-                    # Abandon the dead connection immediately
                     self._abandon()
+
+                    # The dead MCP cancel scope marks our task as cancelled.
+                    # Uncancel it so we can actually continue (sleep, reconnect, etc).
+                    task = asyncio.current_task()
+                    if task and task.cancelling():
+                        task.uncancel()
 
                     if _is_rate_limit(e):
                         wait = RATE_LIMIT_BACKOFF[min(attempt, len(RATE_LIMIT_BACKOFF) - 1)]
