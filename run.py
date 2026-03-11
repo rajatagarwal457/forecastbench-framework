@@ -37,19 +37,27 @@ log = logging.getLogger(__name__)
 
 
 def setup_logging(date: str, verbose: bool):
-    """Log to both console and file."""
+    """Log to both console and file. Only our loggers, not library noise."""
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
     log_file = log_dir / f"{date}.log"
 
-    root = logging.getLogger()
-    root.setLevel(logging.DEBUG if verbose else logging.INFO)
+    # Silence noisy libraries
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("mcp").setLevel(logging.WARNING)
+    logging.getLogger("anyio").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
 
-    # File handler — always verbose
+    # Our loggers
+    our_logger = logging.getLogger()
+    our_logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+    # File handler — always verbose for our code
     fh = logging.FileHandler(log_file, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    root.addHandler(fh)
+    our_logger.addHandler(fh)
 
     # Console handler
     ch = logging.StreamHandler(sys.stdout)
