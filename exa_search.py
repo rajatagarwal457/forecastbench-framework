@@ -3,13 +3,16 @@
 Uses web_search_advanced_exa for date-filtered searches (fair backtesting).
 Multiple searches per question to build richer context.
 
-Each search runs in its own thread with its own event loop and its own
-MCP connection. This is the only reliable way to prevent anyio cancel
-scopes from poisoning the main asyncio event loop on 429s/errors.
+Each search runs in its own thread with its own event loop and fresh
+MCP connection. Optionally routes through Tor SOCKS5 proxy for IP
+rotation to avoid rate limits.
 """
 
 import asyncio
 import logging
+import os
+
+import httpx
 from mcp import ClientSession, types
 from mcp.client.streamable_http import streamable_http_client
 
@@ -22,6 +25,26 @@ EXA_MCP_URL_WITH_ADVANCED = config.EXA_MCP_BASE + "?tools=web_search_advanced_ex
 MAX_SEARCH_RETRIES = 5
 RATE_LIMIT_BACKOFF = [30, 60, 120, 300, 600]
 
+# Tor SOCKS5 proxy — set TOR_PROXY env var or defaults to direct connection
+TOR_PROXY = os.getenv("TOR_PROXY", "")  # e.g. "socks5://127.0.0.1:9050"
+TOR_CONTROL_PORT = int(os.getenv("TOR_CONTROL_PORT", "9051"))
+TOR_CONTROL_PASSWORD = os.getenv("TOR_CONTROL_PASSWORD", "")
+
+
+def _rotate_tor_circuit():
+    """Request a new Tor circuit (new exit IP). Requires stem package."""
+    if not TOR_PROXY or not TOR_CONTROL_PASSWORD:
+        return
+    try:
+        from stem import Signal
+        from stem.control import Controller
+        with Controller.from_port(port=TOR_CONTROL_PORT) as controller:
+            controller.authenticate(password=TOR_CONTROL_PASSWORD)
+            controller.signal(Signal.NEWNYM)
+            log.info("Rotated Tor circuit (new IP).")
+    except Exception as e:
+        log.warning(f"Failed to rotate Tor circuit: {e}")
+
 
 def _build_url() -> str:
     url = EXA_MCP_URL_WITH_ADVANCED
@@ -30,16 +53,28 @@ def _build_url() -> str:
     return url
 
 
+def _make_http_client() -> httpx.AsyncClient:
+    """Create an httpx client, optionally routed through Tor."""
+    kwargs = {
+        "timeout": httpx.Timeout(30.0, read=300.0),
+        "follow_redirects": True,
+    }
+    if TOR_PROXY:
+        kwargs["proxy"] = TOR_PROXY
+    return httpx.AsyncClient(**kwargs)
+
+
 async def _isolated_search(url: str, query: str, end_date: str | None) -> str:
-    """Run a single search on a fresh MCP connection. Runs in its own event loop."""
+    """Run a single search on a fresh MCP connection in its own event loop."""
     args: dict = {"query": query, "numResults": 8}
     if end_date:
         args["endPublishedDate"] = end_date
 
-    async with streamable_http_client(url=url) as (r, w, _):
-        async with ClientSession(r, w) as session:
-            await session.initialize()
-            result = await session.call_tool("web_search_advanced_exa", arguments=args)
+    async with _make_http_client() as http_client:
+        async with streamable_http_client(url=url, http_client=http_client) as (r, w, _):
+            async with ClientSession(r, w) as session:
+                await session.initialize()
+                result = await session.call_tool("web_search_advanced_exa", arguments=args)
 
     parts = []
     for content in result.content:
@@ -93,32 +128,24 @@ def _is_rate_limit(error: BaseException) -> bool:
 class ExaSearcher:
     """Exa web search with complete isolation per search call.
 
-    Each search runs in its own thread with its own event loop and MCP
-    connection. This prevents anyio cancel scope pollution from killing
-    the main event loop on 429s or connection errors.
+    Each search runs in its own thread with its own event loop, httpx client,
+    and MCP connection. Optionally routes through Tor for IP rotation.
     """
 
     def __init__(self, date_cutoff: str | None = None):
         self.date_cutoff = date_cutoff
         self._url = _build_url()
+        if TOR_PROXY:
+            log.info(f"  Exa searches will route through Tor proxy: {TOR_PROXY}")
 
     async def connect(self):
-        """Verify the endpoint works with a test connection."""
-        # Just test that we can connect — each search creates its own connection
-        result = await asyncio.to_thread(_sync_search, self._url, "test", self.date_cutoff)
-        if result:
-            log.info("  Exa MCP endpoint verified.")
+        pass
 
     async def close(self):
-        """Nothing to close — each search manages its own connection."""
         pass
 
     async def search(self, query: str) -> str:
-        """Search with retry and rate limit backoff.
-
-        Each attempt runs in a separate thread with a fresh event loop,
-        so MCP/anyio errors are completely isolated.
-        """
+        """Search with retry and rate limit backoff."""
         last_error = None
         for attempt in range(MAX_SEARCH_RETRIES):
             try:
@@ -128,6 +155,8 @@ class ExaSearcher:
             except Exception as e:
                 last_error = e
                 if _is_rate_limit(e):
+                    # Rotate Tor circuit for a fresh IP before retrying
+                    _rotate_tor_circuit()
                     wait = RATE_LIMIT_BACKOFF[min(attempt, len(RATE_LIMIT_BACKOFF) - 1)]
                     log.warning(f"Rate limited (429). Waiting {wait}s "
                                 f"({attempt+1}/{MAX_SEARCH_RETRIES})...")
