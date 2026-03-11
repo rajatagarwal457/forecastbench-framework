@@ -85,8 +85,14 @@ async def _isolated_search(url: str, query: str, end_date: str | None) -> str:
 
 def _sync_search(url: str, query: str, end_date: str | None) -> str:
     """Synchronous wrapper — creates its own event loop in the calling thread."""
+    import warnings
+    warnings.filterwarnings("ignore", message=".*coroutine.*was never awaited.*")
+    warnings.filterwarnings("ignore", message=".*Enable tracemalloc.*")
+
     loop = asyncio.new_event_loop()
     try:
+        # Suppress "Task was destroyed but it is pending" from MCP cleanup
+        loop.set_exception_handler(lambda l, c: None)
         return loop.run_until_complete(_isolated_search(url, query, end_date))
     finally:
         loop.close()

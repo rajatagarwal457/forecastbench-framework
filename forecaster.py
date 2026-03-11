@@ -433,19 +433,24 @@ class Forecaster:
                     max_tokens = new_max
                     continue
 
-                # Then: compact the input
-                if phase_idx < len(_COMPACTION_PHASES):
+                # Then: compact the input — skip phases that don't reduce anything
+                compacted = False
+                while phase_idx < len(_COMPACTION_PHASES):
                     phase_fn = _COMPACTION_PHASES[phase_idx]
                     before = _total_chars(messages)
                     messages = phase_fn(messages)
                     after = _total_chars(messages)
-                    # Reset max_tokens back up after compaction freed space
-                    max_tokens = config.LLM_MAX_TOKENS
-                    if self.verbose:
-                        print(f"    Context overflow -> phase {phase_idx+1} "
-                              f"({before:,} -> {after:,} chars), retrying...")
                     phase_idx += 1
-                else:
+                    if after < before:
+                        max_tokens = config.LLM_MAX_TOKENS
+                        if self.verbose:
+                            print(f"    Context overflow -> phase {phase_idx} "
+                                  f"({before:,} -> {after:,} chars), retrying...")
+                        compacted = True
+                        break
+                    # Phase didn't help, try next one immediately
+
+                if not compacted:
                     raise
 
     async def forecast(self, q: Question, initial_search: str, today: str) -> list[dict]:
