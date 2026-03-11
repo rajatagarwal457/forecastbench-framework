@@ -48,6 +48,7 @@ def setup_logging(date: str, verbose: bool):
     logging.getLogger("mcp").setLevel(logging.WARNING)
     logging.getLogger("anyio").setLevel(logging.WARNING)
     logging.getLogger("openai").setLevel(logging.WARNING)
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
 
     # Our loggers
     our_logger = logging.getLogger()
