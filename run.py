@@ -63,6 +63,7 @@ def setup_logging(date: str, verbose: bool):
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.DEBUG if verbose else logging.INFO)
     ch.setFormatter(logging.Formatter("%(message)s"))
+    our_logger.addHandler(ch)
     root.addHandler(ch)
 
     log.info(f"Logging to {log_file}")
