@@ -68,8 +68,26 @@ def _build_search_queries(question_text: str, background: str, source: str) -> l
     return queries[:3]
 
 
+def _unwrap_exception(error: BaseException) -> BaseException:
+    """Unwrap single-exception ExceptionGroups (MCP SDK bug #2114)."""
+    while isinstance(error, BaseExceptionGroup) and len(error.exceptions) == 1:
+        error = error.exceptions[0]
+    return error
+
+
 def _is_rate_limit(error: BaseException) -> bool:
-    return "429" in str(error) or "Too Many Requests" in str(error)
+    """Check for 429 rate limit, including inside ExceptionGroups."""
+    error = _unwrap_exception(error)
+    full = repr(error)
+    if "429" in full or "Too Many Requests" in full:
+        return True
+    if isinstance(error, BaseExceptionGroup):
+        for sub in error.exceptions:
+            if _is_rate_limit(sub):
+                return True
+    if error.__cause__:
+        return _is_rate_limit(error.__cause__)
+    return False
 
 
 class ExaSearcher:
