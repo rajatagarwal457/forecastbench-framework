@@ -2,7 +2,10 @@
 
 Uses web_search_advanced_exa for date-filtered searches (fair backtesting).
 Multiple searches per question to build richer context.
-Auto-reconnects on connection drops and backs off on rate limits (429).
+
+Each search runs in its own thread with its own event loop and its own
+MCP connection. This is the only reliable way to prevent anyio cancel
+scopes from poisoning the main asyncio event loop on 429s/errors.
 """
 
 import asyncio
@@ -20,21 +23,38 @@ MAX_SEARCH_RETRIES = 5
 RATE_LIMIT_BACKOFF = [30, 60, 120, 300, 600]
 
 
-async def _search(query: str, session: ClientSession,
-                  end_date: str | None = None,
-                  max_chars: int = 0) -> str:
+def _build_url() -> str:
+    url = EXA_MCP_URL_WITH_ADVANCED
+    if config.EXA_API_KEY:
+        url += f"&exaApiKey={config.EXA_API_KEY}"
+    return url
+
+
+async def _isolated_search(url: str, query: str, end_date: str | None) -> str:
+    """Run a single search on a fresh MCP connection. Runs in its own event loop."""
     args: dict = {"query": query, "numResults": 8}
-    if max_chars > 0:
-        args["contextMaxCharacters"] = max_chars
     if end_date:
         args["endPublishedDate"] = end_date
 
-    result = await session.call_tool("web_search_advanced_exa", arguments=args)
+    async with streamable_http_client(url=url) as (r, w, _):
+        async with ClientSession(r, w) as session:
+            await session.initialize()
+            result = await session.call_tool("web_search_advanced_exa", arguments=args)
+
     parts = []
     for content in result.content:
         if isinstance(content, types.TextContent):
             parts.append(content.text)
     return "\n".join(parts)
+
+
+def _sync_search(url: str, query: str, end_date: str | None) -> str:
+    """Synchronous wrapper — creates its own event loop in the calling thread."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_isolated_search(url, query, end_date))
+    finally:
+        loop.close()
 
 
 def _build_search_queries(question_text: str, background: str, source: str) -> list[str]:
@@ -53,125 +73,55 @@ def _is_rate_limit(error: BaseException) -> bool:
 
 
 class ExaSearcher:
-    """Manages an MCP connection to Exa with date-filtered search.
+    """Exa web search with complete isolation per search call.
 
-    On connection death (429, CancelledError, etc.), the old connection
-    is ABANDONED (references dropped, no __aexit__) and a completely
-    fresh one is created. This prevents CancelledError from dead MCP
-    transports from poisoning the asyncio event loop.
+    Each search runs in its own thread with its own event loop and MCP
+    connection. This prevents anyio cancel scope pollution from killing
+    the main event loop on 429s or connection errors.
     """
 
     def __init__(self, date_cutoff: str | None = None):
-        self._session: ClientSession | None = None
-        self._cm_transport = None
-        self._cm_session = None
-        self._lock = asyncio.Lock()
         self.date_cutoff = date_cutoff
-        self._connected = False
-
-    def _build_url(self) -> str:
-        url = EXA_MCP_URL_WITH_ADVANCED
-        if config.EXA_API_KEY:
-            url += f"&exaApiKey={config.EXA_API_KEY}"
-        return url
+        self._url = _build_url()
 
     async def connect(self):
-        """Create a fresh MCP connection."""
-        url = self._build_url()
-        self._cm_transport = streamable_http_client(url=url)
-        read_stream, write_stream, _ = await self._cm_transport.__aenter__()
-        self._cm_session = ClientSession(read_stream, write_stream)
-        self._session = await self._cm_session.__aenter__()
-        await self._session.initialize()
-
-        tools = await self._session.list_tools()
-        tool_names = [t.name for t in tools.tools]
-        if "web_search_advanced_exa" not in tool_names:
-            raise RuntimeError(f"web_search_advanced_exa not available. Got: {tool_names}")
-        self._connected = True
-
-    def _abandon(self):
-        """Drop all references to a dead connection WITHOUT calling __aexit__.
-
-        This is the key fix: calling __aexit__ on a dead MCP session propagates
-        CancelledError through anyio cancel scopes, poisoning the entire event loop.
-        We just let the garbage collector clean up the dead objects.
-        """
-        self._connected = False
-        self._session = None
-        self._cm_session = None
-        self._cm_transport = None
+        """Verify the endpoint works with a test connection."""
+        # Just test that we can connect — each search creates its own connection
+        result = await asyncio.to_thread(_sync_search, self._url, "test", self.date_cutoff)
+        if result:
+            log.info("  Exa MCP endpoint verified.")
 
     async def close(self):
-        """Graceful close for healthy connections (e.g. end of run)."""
-        self._connected = False
-        self._session = None
-        for cm in [self._cm_session, self._cm_transport]:
-            if cm is not None:
-                try:
-                    await cm.__aexit__(None, None, None)
-                except BaseException:
-                    pass
-        self._cm_session = None
-        self._cm_transport = None
-
-    async def _fresh_connect(self):
-        """Abandon dead connection and create a completely fresh one."""
-        self._abandon()
-        log.info("Creating fresh Exa MCP connection...")
-        await self.connect()
-        log.info("Fresh connection established.")
-
-    async def _do_search(self, query: str) -> str:
-        """Execute a single search. Runs inside an isolated task."""
-        if not self._connected or not self._session:
-            await self._fresh_connect()
-        return await _search(query, self._session, self.date_cutoff)
+        """Nothing to close — each search manages its own connection."""
+        pass
 
     async def search(self, query: str) -> str:
-        """Search with auto-reconnect and rate limit backoff.
+        """Search with retry and rate limit backoff.
 
-        Each attempt runs in an isolated asyncio.Task so that CancelledError
-        from dead MCP cancel scopes doesn't poison our main task.
+        Each attempt runs in a separate thread with a fresh event loop,
+        so MCP/anyio errors are completely isolated.
         """
-        async with self._lock:
-            last_error = None
-            for attempt in range(MAX_SEARCH_RETRIES):
-                try:
-                    # Run in a separate task to isolate cancel scopes
-                    task = asyncio.create_task(self._do_search(query))
-                    return await asyncio.shield(task)
+        last_error = None
+        for attempt in range(MAX_SEARCH_RETRIES):
+            try:
+                return await asyncio.to_thread(
+                    _sync_search, self._url, query, self.date_cutoff,
+                )
+            except Exception as e:
+                last_error = e
+                if _is_rate_limit(e):
+                    wait = RATE_LIMIT_BACKOFF[min(attempt, len(RATE_LIMIT_BACKOFF) - 1)]
+                    log.warning(f"Rate limited (429). Waiting {wait}s "
+                                f"({attempt+1}/{MAX_SEARCH_RETRIES})...")
+                    await asyncio.sleep(wait)
+                else:
+                    log.warning(f"Search attempt {attempt+1}/{MAX_SEARCH_RETRIES} "
+                                f"failed: {type(e).__name__}: {e}")
+                    if attempt < MAX_SEARCH_RETRIES - 1:
+                        await asyncio.sleep(2)
 
-                except (asyncio.CancelledError, BaseException) as e:
-                    last_error = e
-                    self._abandon()
-
-                    # Ensure our own task is not marked cancelled
-                    me = asyncio.current_task()
-                    while me and me.cancelling():
-                        me.uncancel()
-
-                    # Cancel the isolated task if still running
-                    if not task.done():
-                        task.cancel()
-                        try:
-                            await task
-                        except BaseException:
-                            pass
-
-                    if _is_rate_limit(e):
-                        wait = RATE_LIMIT_BACKOFF[min(attempt, len(RATE_LIMIT_BACKOFF) - 1)]
-                        log.warning(f"Rate limited (429). Waiting {wait}s "
-                                    f"({attempt+1}/{MAX_SEARCH_RETRIES})...")
-                        await asyncio.sleep(wait)
-                    else:
-                        log.warning(f"Search attempt {attempt+1}/{MAX_SEARCH_RETRIES} "
-                                    f"failed: {type(e).__name__}: {e}")
-                        if attempt < MAX_SEARCH_RETRIES - 1:
-                            await asyncio.sleep(2)
-
-            log.error(f"Search failed after {MAX_SEARCH_RETRIES} attempts: {last_error}")
-            return ""
+        log.error(f"Search failed after {MAX_SEARCH_RETRIES} attempts: {last_error}")
+        return ""
 
     async def search_for_question(self, question_text: str, background: str = "",
                                   source: str = "") -> str:

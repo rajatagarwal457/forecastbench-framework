@@ -237,12 +237,7 @@ async def run_pipeline(args):
             else:
                 log.info("Connecting to Exa MCP (live, no date cutoff)...")
             searcher = ExaSearcher(date_cutoff=date_cutoff)
-            try:
-                await searcher.connect()
-                log.info("  Connected.")
-            except Exception as e:
-                log.error(f"  Exa connection failed: {e}")
-                searcher = None
+            log.info("  Exa searcher ready (each search creates its own connection).")
         else:
             log.info("Skipping web search (--no-search)")
 
