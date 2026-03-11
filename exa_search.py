@@ -55,8 +55,10 @@ def _is_rate_limit(error: BaseException) -> bool:
 class ExaSearcher:
     """Manages an MCP connection to Exa with date-filtered search.
 
-    Auto-reconnects on connection drops. Backs off on 429 rate limits.
-    Catches BaseException (including CancelledError from dead MCP transports).
+    On connection death (429, CancelledError, etc.), the old connection
+    is ABANDONED (references dropped, no __aexit__) and a completely
+    fresh one is created. This prevents CancelledError from dead MCP
+    transports from poisoning the asyncio event loop.
     """
 
     def __init__(self, date_cutoff: str | None = None):
@@ -74,6 +76,7 @@ class ExaSearcher:
         return url
 
     async def connect(self):
+        """Create a fresh MCP connection."""
         url = self._build_url()
         self._cm_transport = streamable_http_client(url=url)
         read_stream, write_stream, _ = await self._cm_transport.__aenter__()
@@ -87,11 +90,22 @@ class ExaSearcher:
             raise RuntimeError(f"web_search_advanced_exa not available. Got: {tool_names}")
         self._connected = True
 
-    async def close(self):
-        """Tear down everything. Swallow all errors — the connection may already be dead."""
+    def _abandon(self):
+        """Drop all references to a dead connection WITHOUT calling __aexit__.
+
+        This is the key fix: calling __aexit__ on a dead MCP session propagates
+        CancelledError through anyio cancel scopes, poisoning the entire event loop.
+        We just let the garbage collector clean up the dead objects.
+        """
         self._connected = False
         self._session = None
-        # Force-close transport and session, ignoring any errors
+        self._cm_session = None
+        self._cm_transport = None
+
+    async def close(self):
+        """Graceful close for healthy connections (e.g. end of run)."""
+        self._connected = False
+        self._session = None
         for cm in [self._cm_session, self._cm_transport]:
             if cm is not None:
                 try:
@@ -101,29 +115,31 @@ class ExaSearcher:
         self._cm_session = None
         self._cm_transport = None
 
-    async def _reconnect(self):
-        log.warning("Reconnecting to Exa MCP...")
-        await self.close()
+    async def _fresh_connect(self):
+        """Abandon dead connection and create a completely fresh one."""
+        self._abandon()
+        log.info("Creating fresh Exa MCP connection...")
         await self.connect()
-        log.info("Reconnected to Exa MCP.")
+        log.info("Fresh connection established.")
 
     async def search(self, query: str) -> str:
         """Search with auto-reconnect and rate limit backoff.
 
-        Catches BaseException because a 429 at the MCP transport level
-        raises CancelledError (BaseException), not a regular Exception.
+        On any failure, the dead connection is abandoned (not closed)
+        and a fresh one is created. This prevents cancel scope pollution.
         """
         async with self._lock:
             last_error = None
             for attempt in range(MAX_SEARCH_RETRIES):
                 try:
                     if not self._connected or not self._session:
-                        await self._reconnect()
+                        await self._fresh_connect()
                     return await _search(query, self._session, self.date_cutoff)
 
                 except BaseException as e:
                     last_error = e
-                    self._connected = False  # assume connection is dead
+                    # Abandon the dead connection immediately
+                    self._abandon()
 
                     if _is_rate_limit(e):
                         wait = RATE_LIMIT_BACKOFF[min(attempt, len(RATE_LIMIT_BACKOFF) - 1)]
@@ -134,11 +150,10 @@ class ExaSearcher:
                         log.warning(f"Search attempt {attempt+1}/{MAX_SEARCH_RETRIES} "
                                     f"failed: {type(e).__name__}: {e}")
                         if attempt < MAX_SEARCH_RETRIES - 1:
-                            # Brief pause before reconnect
                             await asyncio.sleep(2)
 
             log.error(f"Search failed after {MAX_SEARCH_RETRIES} attempts: {last_error}")
-            return ""  # return empty instead of crashing the whole run
+            return ""
 
     async def search_for_question(self, question_text: str, background: str = "",
                                   source: str = "") -> str:
@@ -147,23 +162,19 @@ class ExaSearcher:
         seen_urls = set()
 
         for i, query in enumerate(queries):
-            try:
-                result = await self.search(query)
-                if result:
-                    lines = result.split("\n")
-                    filtered = []
-                    for line in lines:
-                        if line.startswith("URL: "):
-                            url = line[5:].strip()
-                            if url in seen_urls:
-                                continue
-                            seen_urls.add(url)
-                        filtered.append(line)
-                    block = "\n".join(filtered)
-                    all_results.append(f"--- Search {i+1}: {query[:80]} ---\n{block}")
-            except BaseException as e:
-                log.warning(f"Search for question failed on query {i+1}: {e}")
-                continue
+            result = await self.search(query)
+            if result:
+                lines = result.split("\n")
+                filtered = []
+                for line in lines:
+                    if line.startswith("URL: "):
+                        url = line[5:].strip()
+                        if url in seen_urls:
+                            continue
+                        seen_urls.add(url)
+                    filtered.append(line)
+                block = "\n".join(filtered)
+                all_results.append(f"--- Search {i+1}: {query[:80]} ---\n{block}")
 
         return "\n\n".join(all_results)
 
