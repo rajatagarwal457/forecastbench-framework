@@ -168,16 +168,17 @@ class ExaSearcher:
                 )
             except Exception as e:
                 last_error = e
+                # Unwrap ExceptionGroup to see the real error
+                real = _unwrap_exception(e)
                 if _is_rate_limit(e):
-                    # Rotate Tor circuit for a fresh IP before retrying
                     _rotate_tor_circuit()
                     wait = RATE_LIMIT_BACKOFF[min(attempt, len(RATE_LIMIT_BACKOFF) - 1)]
-                    log.warning(f"Rate limited (429). Waiting {wait}s "
+                    log.warning(f"Rate limited (429). Rotating IP, waiting {wait}s "
                                 f"({attempt+1}/{MAX_SEARCH_RETRIES})...")
                     await asyncio.sleep(wait)
                 else:
                     log.warning(f"Search attempt {attempt+1}/{MAX_SEARCH_RETRIES} "
-                                f"failed: {type(e).__name__}: {e}")
+                                f"failed: {type(real).__name__}: {real}")
                     if attempt < MAX_SEARCH_RETRIES - 1:
                         await asyncio.sleep(2)
 
