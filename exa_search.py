@@ -83,17 +83,25 @@ async def _isolated_search(url: str, query: str, end_date: str | None) -> str:
     return "\n".join(parts)
 
 
+SEARCH_TIMEOUT = 60  # seconds — kill hung connections
+
+
 def _sync_search(url: str, query: str, end_date: str | None) -> str:
     """Synchronous wrapper — creates its own event loop in the calling thread."""
     import warnings
     warnings.filterwarnings("ignore", message=".*coroutine.*was never awaited.*")
     warnings.filterwarnings("ignore", message=".*Enable tracemalloc.*")
 
+    # Suppress EpollSelector and other asyncio debug logs in this thread
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
+
     loop = asyncio.new_event_loop()
     try:
-        # Suppress "Task was destroyed but it is pending" from MCP cleanup
         loop.set_exception_handler(lambda l, c: None)
-        return loop.run_until_complete(_isolated_search(url, query, end_date))
+        # Timeout so hung connections don't block forever
+        return loop.run_until_complete(
+            asyncio.wait_for(_isolated_search(url, query, end_date), timeout=SEARCH_TIMEOUT)
+        )
     finally:
         loop.close()
 
