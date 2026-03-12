@@ -124,18 +124,18 @@ def _unwrap_exception(error: BaseException) -> BaseException:
     return error
 
 
-def _is_rate_limit(error: BaseException) -> bool:
-    """Check for 429 rate limit, including inside ExceptionGroups."""
+def _is_blocked(error: BaseException) -> bool:
+    """Check for 429 rate limit or 403 forbidden (blocked IP), including inside ExceptionGroups."""
     error = _unwrap_exception(error)
     full = repr(error)
-    if "429" in full or "Too Many Requests" in full:
+    if any(x in full for x in ["429", "Too Many Requests", "403", "Forbidden"]):
         return True
     if isinstance(error, BaseExceptionGroup):
         for sub in error.exceptions:
-            if _is_rate_limit(sub):
+            if _is_blocked(sub):
                 return True
     if error.__cause__:
-        return _is_rate_limit(error.__cause__)
+        return _is_blocked(error.__cause__)
     return False
 
 
@@ -168,19 +168,22 @@ class ExaSearcher:
                 )
             except Exception as e:
                 last_error = e
-                # Unwrap ExceptionGroup to see the real error
                 real = _unwrap_exception(e)
-                if _is_rate_limit(e):
+                if _is_blocked(e):
+                    # 429 or 403 — rotate IP and back off
                     _rotate_tor_circuit()
                     wait = RATE_LIMIT_BACKOFF[min(attempt, len(RATE_LIMIT_BACKOFF) - 1)]
-                    log.warning(f"Rate limited (429). Rotating IP, waiting {wait}s "
+                    log.warning(f"Blocked ({type(real).__name__}). Rotating IP, waiting {wait}s "
                                 f"({attempt+1}/{MAX_SEARCH_RETRIES})...")
                     await asyncio.sleep(wait)
                 else:
                     log.warning(f"Search attempt {attempt+1}/{MAX_SEARCH_RETRIES} "
                                 f"failed: {type(real).__name__}: {real}")
+                    # Rotate IP on any failure — might help
+                    _rotate_tor_circuit()
                     if attempt < MAX_SEARCH_RETRIES - 1:
-                        await asyncio.sleep(2)
+                        # Wait 10s for Tor to establish new circuit
+                        await asyncio.sleep(10)
 
         log.error(f"Search failed after {MAX_SEARCH_RETRIES} attempts: {last_error}")
         return ""
