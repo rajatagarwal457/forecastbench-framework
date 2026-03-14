@@ -74,13 +74,40 @@ def _download(url: str, cache_path: Path) -> dict:
     return data
 
 
+def download_latest_question_set() -> QuestionSet:
+    """Download the latest question set by resolving the symlink."""
+    symlink_url = f"{config.QUESTION_SET_RAW_BASE}/latest-llm.json"
+    print(f"Resolving {symlink_url} ...")
+    resp = httpx.get(symlink_url, follow_redirects=True, timeout=60)
+    resp.raise_for_status()
+    target = resp.text.strip()
+
+    # target is like "2026-03-01-llm.json"
+    if target.endswith("-llm.json"):
+        date = target.replace("-llm.json", "")
+        print(f"  Latest question set: {date}")
+        return download_question_set(date)
+    else:
+        # In case the symlink resolves to actual JSON content
+        data = json.loads(resp.text)
+        date = data["forecast_due_date"]
+        filename = f"{date}-llm.json"
+        cache_path = CACHE_DIR / "question_sets" / filename
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        return _parse_question_set(data, filename)
+
+
 def download_question_set(date: str) -> QuestionSet:
     """Download the question set for a given forecast_due_date (YYYY-MM-DD)."""
     filename = f"{date}-llm.json"
     url = f"{config.QUESTION_SET_RAW_BASE}/{filename}"
     cache_path = CACHE_DIR / "question_sets" / filename
     data = _download(url, cache_path)
+    return _parse_question_set(data, filename)
 
+
+def _parse_question_set(data: dict, filename: str) -> QuestionSet:
     questions = []
     for q in data["questions"]:
         res_dates = q.get("resolution_dates")

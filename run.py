@@ -27,7 +27,7 @@ import sys
 import time
 from pathlib import Path
 
-from questions import download_question_set, download_resolutions, Question
+from questions import download_question_set, download_latest_question_set, download_resolutions, Question
 from exa_search import ExaSearcher
 from forecaster import Forecaster
 from submission import write_submission, validate_submission
@@ -195,12 +195,19 @@ def make_baseline_forecasts(questions: list[Question]) -> list[dict]:
 
 
 async def run_pipeline(args):
-    date = args.date
+    if args.latest:
+        log.info("Fetching latest question set...")
+        qs = download_latest_question_set()
+        date = qs.forecast_due_date
+        log.info(f"  Latest question set: {date}")
+    elif args.date:
+        date = args.date
+        qs = download_question_set(date)
+    else:
+        raise SystemExit("Provide --date YYYY-MM-DD or --latest")
 
     setup_logging(date, args.verbose)
 
-    log.info(f"Downloading question set for {date}...")
-    qs = download_question_set(date)
     log.info(f"  {len(qs.questions)} questions "
              f"({len(qs.market_questions)} market, {len(qs.dataset_questions)} dataset)")
 
@@ -282,7 +289,8 @@ async def run_pipeline(args):
 
 def main():
     parser = argparse.ArgumentParser(description="ForecastBench agentic pipeline")
-    parser.add_argument("--date", required=True, help="Forecast due date (YYYY-MM-DD)")
+    parser.add_argument("--date", help="Forecast due date (YYYY-MM-DD)")
+    parser.add_argument("--latest", action="store_true", help="Fetch and run the latest question set")
     parser.add_argument("--evaluate", action="store_true", help="Evaluate against resolutions")
     parser.add_argument("--no-search", action="store_true", help="Skip Exa web search")
     parser.add_argument("--baseline", action="store_true", help="Always predict 0.5 (no LLM)")
